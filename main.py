@@ -1,3 +1,5 @@
+# E.g. python3 main.py --source deepseek-ai/DeepSeek-R1 --target "DeepSeek-R1-Pruned-23B" --layers 2 --username "ubicloud"
+
 import os
 import argparse
 import gc
