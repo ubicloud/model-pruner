@@ -3,9 +3,78 @@
 import os
 import argparse
 import gc
+from huggingface_hub import HfApi
 import shutil
+import tempfile
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def get_grouped_param_counts(model):
+    total_params = 0
+    grouped_counts = {}
+
+    for name, param in model.named_parameters():
+        count = param.numel()
+        total_params += count
+
+        parts = name.split(".")
+        if len(parts) >= 3 and parts[1] in ["layers", "h", "blocks"]:
+            group_name = ".".join(parts[:3])  # e.g. model.layers.0
+        else:
+            group_name = parts[0] if parts else name  # keep it readable
+
+        grouped_counts[group_name] = grouped_counts.get(group_name, 0) + count
+
+    return total_params, grouped_counts
+
+
+def stats_to_markdown(title, total_params, grouped_counts, top_k=40):
+    # Sort biggest groups first, keep card small
+    rows = sorted(grouped_counts.items(),
+                  key=lambda x: x[1], reverse=True)[:top_k]
+
+    md = []
+    md.append(f"### {title}\n\n")
+    md.append("\n| Module / Layer group | Parameters |\n|---|---:|\n")
+    for name, cnt in rows:
+        md.append(f"| `{name}` | {cnt:,} |\n")
+    if len(grouped_counts) > top_k:
+        md.append(f"| *… ({len(grouped_counts) - top_k} more groups)* | — |\n")
+
+    md.append(f"| **TOTAL** | **{total_params:,}** |\n")
+    md.append("\n")
+
+    return "".join(md)
+
+
+def build_model_card_intro(source_model_id, layers_to_keep, original_layers, orig_total, orig_groups,
+                           new_total, new_groups):
+    yaml = f"""---
+license: mit
+library_name: transformers
+pipeline_tag: text-generation
+tags:
+  - pruned
+  - research
+base_model: {source_model_id}
+---
+
+"""
+    header = (
+        f"🛠️ **Created with [ubicloud/model-pruner](https://github.com/ubicloud/model-pruner)**\n\n"
+    )
+    body = (
+        f"⚠️ **Research-only model**\n\n"
+        f"This model is a **pruned variant of `{source_model_id}`** that retains "
+        f"the **first {layers_to_keep} layers** of the original "
+        f"**{original_layers}-layer architecture**.\n\n"
+        f"It is intended **for pipeline testing and performance research rather than production use**.\n\n"
+    )
+    before_md = stats_to_markdown("Before pruning", orig_total, orig_groups)
+    after_md = stats_to_markdown("After pruning",  new_total, new_groups)
+
+    return yaml + header + body + "## Model statistics\n\n" + before_md + after_md
 
 
 def print_model_stats(model, title="Model Statistics"):
@@ -67,6 +136,7 @@ def create_pruned_model(source_model_id, new_repo_id, layers_to_keep, username, 
         return
 
     print_model_stats(model, title="Original Model Structure")
+    orig_total, orig_groups = get_grouped_param_counts(model)
 
     # 2. Verify and Reduce Layers
     try:
@@ -103,6 +173,12 @@ def create_pruned_model(source_model_id, new_repo_id, layers_to_keep, username, 
         # UPDATE CONFIG
         setattr(model.config, config_key, layers_to_keep)
 
+        if hasattr(model.config, "layer_types") and model.config.layer_types is not None:
+            model.config.layer_types = model.config.layer_types[:layers_to_keep]
+        if hasattr(model.config, "max_window_layers") and model.config.max_window_layers is not None:
+            model.config.max_window_layers = min(
+                model.config.max_window_layers, layers_to_keep)
+
         # AGGRESSIVE CLEANUP
         # Force Python to release the memory of the dropped layers immediately
         gc.collect()
@@ -110,6 +186,7 @@ def create_pruned_model(source_model_id, new_repo_id, layers_to_keep, username, 
 
         print(f"New layer count: {layers_to_keep}")
         print_model_stats(model, title="New Model Structure")
+        new_total, new_groups = get_grouped_param_counts(model)
 
     except AttributeError as e:
         print(f"Error accessing model layers: {e}")
@@ -124,6 +201,34 @@ def create_pruned_model(source_model_id, new_repo_id, layers_to_keep, username, 
         model.push_to_hub(full_repo_id, token=token, private=False)
         tokenizer.push_to_hub(full_repo_id, token=token, private=False)
 
+        # Create model card intro
+        api = HfApi()
+        readme = build_model_card_intro(
+            source_model_id=source_model_id,
+            layers_to_keep=layers_to_keep,
+            original_layers=current_layer_count,
+            orig_total=orig_total, orig_groups=orig_groups,
+            new_total=new_total, new_groups=new_groups,
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".md",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            tmp.write(readme)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = tmp.name
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo="README.md",
+            repo_id=full_repo_id,
+            repo_type="model",
+            token=token,
+            commit_message="Add model card",
+        )
+
         print("\nSuccess! Your pruned model is live at:")
         print(f"https://huggingface.co/{full_repo_id}")
 
@@ -133,6 +238,8 @@ def create_pruned_model(source_model_id, new_repo_id, layers_to_keep, username, 
         # Cleanup temporary offload folder
         if os.path.exists("offload_tmp"):
             shutil.rmtree("offload_tmp")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 if __name__ == "__main__":
