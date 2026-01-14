@@ -1,4 +1,4 @@
-# ✂️ Model Depth Pruner
+# ✂️ Model Pruner
 
 **Create lightweight versions of massive LLMs by truncating their transformer layers.**
 
