@@ -2,11 +2,12 @@ import argparse
 from huggingface_hub import HfApi, hf_hub_download
 import json
 import os
+import re
 from safetensors.torch import load_file, save_file
-import tempfile
 import torch
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM
+import transformers
+from transformers import AutoConfig
 from transformers.utils import import_utils
 
 GiB = 1024 ** 3
@@ -39,7 +40,8 @@ def create_readme(args: argparse.Namespace, output_dir: str) -> None:
         print(f"Failed to download README.md from source model: {e}")
         content = ""
     config = AutoConfig.from_pretrained(args.source, trust_remote_code=True)
-    source_layers = config.num_hidden_layers
+    text_config = getattr(config, "text_config", config)
+    source_layers = text_config.num_hidden_layers
     content = f"""---
 base_model: {args.source}
 library: transformers
@@ -49,33 +51,46 @@ tags:
 
 *This model is a pruned variant of {args.source} that retains the first 
 {args.layers} layer(s) of the original {source_layers} layer(s) architecture.
-It is intended for performance research rather than production use.*
+It is intended for pipeline testing and performance research rather than 
+production use.*
 
 """ + content
     with open(os.path.join(output_dir, "README.md"), "w", encoding="utf-8") as f:
         f.write(content)
 
 
+def canonicalize_module_name(name: str) -> str:
+    for suffix in [".weight", ".bias", ".weight_scale_inv", ".bias_scale_inv"]:
+        name = name.rstrip(suffix)
+    name = re.sub(r"\.experts\..*$", ".experts", name)
+    return name
+
+
 def download_and_consolidate_weights(
         args: argparse.Namespace, output_dir: str) -> None:
     # Obtain relevant weight names
     config = AutoConfig.from_pretrained(args.source, trust_remote_code=True)
-    source_layers = config.num_hidden_layers
+    text_config = getattr(config, "text_config", config)
+    source_layers = text_config.num_hidden_layers
     print(f"Source model layers: {source_layers}")
     if source_layers <= args.layers:
         print("No pruning needed.")
         exit(0)
-    config.num_hidden_layers = args.layers
+    text_config.num_hidden_layers = args.layers
     for key in ["layer_types"]:
-        if hasattr(config, key):
-            current_list = getattr(config, key)
+        if hasattr(text_config, key):
+            current_list = getattr(text_config, key)
             if isinstance(current_list, list):
-                setattr(config, key, current_list[:args.layers])
+                setattr(text_config, key, current_list[:args.layers])
     config.save_pretrained(output_dir)
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
-            config, trust_remote_code=True)
-    relevant_weight_names = set(model.state_dict().keys())
+        architecture = config.architectures[0]
+        model_class = getattr(transformers, architecture)
+        model = model_class(config)
+    relevant_module_names = set(model.state_dict().keys())
+    relevant_module_names = {
+        canonicalize_module_name(name) for name in relevant_module_names
+    }
 
     # Obtain relevant shards
     hf_api = HfApi()
@@ -88,7 +103,9 @@ def download_and_consolidate_weights(
         source_weight_map = source_index["weight_map"]
         relevant_source_shards = {
             source_weight_map[name]
-            for name in relevant_weight_names if name in source_weight_map}
+            for name in source_weight_map
+            if canonicalize_module_name(name) in relevant_module_names
+        }
         relevant_source_shards = sorted(list(relevant_source_shards))
     elif "model.safetensors" in repo_files:
         relevant_source_shards = ["model.safetensors"]
@@ -110,7 +127,7 @@ def download_and_consolidate_weights(
             repo_id=args.source, filename=source_shard)
         source_weights = load_file(shard_path)
         for weight_name, weight in source_weights.items():
-            if not weight_name in relevant_weight_names:
+            if not canonicalize_module_name(weight_name) in relevant_module_names:
                 continue
             weight_size = weight.numel() * weight.element_size()
             buffer_size += weight_size
