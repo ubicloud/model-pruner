@@ -11,12 +11,13 @@ GiB = 1024 ** 3
 MAX_SHARD_SIZE = 4 * GiB
 
 
-def download_config(model: str) -> dict:
+def download_config(model: str, model_path: str | None) -> dict:
     """
     Downloads and parses the config.json file for a given model from the Hugging Face Hub.
     """
     try:
-        config_path = hf_hub_download(repo_id=model, filename="config.json")
+        config_path = hf_hub_download(
+            repo_id=model, filename="config.json", local_dir=model_path)
     except Exception as e:
         print(f"Failed to download config.json from source model: {e}")
         exit(1)
@@ -32,11 +33,12 @@ def create_readme(args: argparse.Namespace, output_dir: str) -> None:
     It fetches the source model's README, strips any existing YAML frontmatter, 
     and prepends a new frontmatter and disclaimer about the pruning process.
     """
+    local_dir = args.source_path
     print(f"Generating README.md for the pruned model: {args.target}")
     try:
         # Attempt to get the original README
         readme_path = hf_hub_download(
-            repo_id=args.source, filename="README.md")
+            repo_id=args.source, filename="README.md", local_dir=local_dir)
         with open(readme_path, "r", encoding="utf-8") as f:
             content = f.read()
             # Strip original YAML frontmatter if it exists
@@ -46,7 +48,7 @@ def create_readme(args: argparse.Namespace, output_dir: str) -> None:
         print(f"Failed to download README.md from source model: {e}")
         content = ""
 
-    config = download_config(args.source)
+    config = download_config(args.source, local_dir)
     # Handle multimodal architectures that nest text config
     text_config = config.get("text_config", config)
     source_layers = text_config["num_hidden_layers"]
@@ -59,9 +61,9 @@ tags:
 - pruned
 ---
 
-*This model is a pruned variant of {args.source} that retains the first 
+*This model is a pruned variant of {args.source} that retains the first
 {args.layers} layer(s) of the original {source_layers} layer(s) architecture.
-It is intended for pipeline testing and performance research rather than 
+It is intended for pipeline testing and performance research rather than
 production use.*
 
 Made with ❤️ by [Model Pruner](https://github.com/ubicloud/model-pruner.git)
@@ -93,7 +95,8 @@ def download_and_consolidate_weights(
     and repacks the remaining weights into new, consolidated shard files.
     """
     # Obtain relevant weight names and update configuration
-    config = download_config(args.source)
+    local_dir = args.source_path
+    config = download_config(args.source, local_dir)
     text_config = config.get("text_config", config)
     source_layers = text_config["num_hidden_layers"]
     print(f"Source model layers: {source_layers}")
@@ -124,7 +127,7 @@ def download_and_consolidate_weights(
     if "model.safetensors.index.json" in repo_files:
         # Sharded model
         index_path = hf_hub_download(
-            repo_id=args.source, filename="model.safetensors.index.json")
+            repo_id=args.source, filename="model.safetensors.index.json", local_dir=local_dir)
         with open(index_path, "r") as f:
             source_index = json.load(f)
 
@@ -156,12 +159,13 @@ def download_and_consolidate_weights(
 
     # Pre-download all relevant source shards so we don't block during processing
     for source_shard in relevant_source_shards:
-        hf_hub_download(repo_id=args.source, filename=source_shard)
+        hf_hub_download(repo_id=args.source,
+                        filename=source_shard, local_dir=local_dir)
 
     # Process and consolidate the weights
     for source_shard in tqdm(relevant_source_shards, desc="Consolidating relevant weights"):
         shard_path = hf_hub_download(
-            repo_id=args.source, filename=source_shard)
+            repo_id=args.source, filename=source_shard, local_dir=local_dir)
         source_weights = load_file(shard_path)
 
         for weight_name, weight in source_weights.items():
@@ -203,6 +207,8 @@ def main(args: argparse.Namespace):
     # Set up local caching/output directory
     base_cache_dir = os.path.expanduser("~/.cache/model_pruner")
     output_dir = os.path.join(base_cache_dir, args.target.replace('/', '--'))
+    if args.target_path is not None:
+        output_dir = args.target_path
     print(f"Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -250,6 +256,10 @@ if __name__ == "__main__":
                            help="The number of layers to keep. E.g. 8")
     argparser.add_argument("--upload", action="store_true",
                            help="Whether to upload to Hugging Face.")
+    argparser.add_argument("--source-path", type=str,
+                           required=False, help="HF model download path. Default to ~/.cache/model_pruner/...")
+    argparser.add_argument("--target-path", type=str,
+                           required=False, help="HF pruned model upload path. Default to ~/.cache/model_pruner/...")
     args = argparser.parse_args()
 
     main(args)
