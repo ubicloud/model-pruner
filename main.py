@@ -81,7 +81,7 @@ def should_keep(weight_name: str, layers_to_keep: int) -> bool:
     Extracts the layer index using regex and drops it if it exceeds our target.
     """
     # Look for patterns like '.layers.5.' or '.layers.12.' in the tensor name
-    layer_id = re.search(r"\.layers\.(\d+)\.", weight_name)
+    layer_id = re.search(r"(?:^|\.)layers\.(\d+)\.", weight_name)
     if layer_id is not None and int(layer_id.group(1)) >= layers_to_keep:
         return False
     # Keep non-layer specific weights (like embeddings, lm_head) and layers within our threshold
